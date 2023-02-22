@@ -1,0 +1,515 @@
+#!/usr/bin/env python
+"""
+IPMI Tool v2
+"""
+import argparse
+import chef
+import hashlib
+import os
+import subprocess
+import sys
+import textwrap
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+from requests.packages.urllib3.exceptions import InsecurePlatformWarning
+import paramiko
+import redfish
+
+# This will patch the built-in 'print' function to append/prepend '```'
+# to all messages in order to make output monospaced in Slack.
+
+
+class slack_print:
+    def __init__(self, stdout):
+        self.stdout = stdout
+
+    def write(self, text):
+        self.stdout.write('```' + text)
+        self.stdout.flush()
+
+    def close(self):
+        self.stdout.close()
+
+
+monoprint = slack_print(sys.stdout)
+sys.stdout = monoprint
+
+# We are on an old Python, need to silence warnings.
+requests.packages.urllib3.disable_warnings()
+
+TOOL_HELPTEXT = '''IPMI Tool
+    Usage: ./ipmi [command] --name <hostname> [argument(s)]
+
+    Currently supported IPMI commands are:
+        * power - Power Status
+        * health - Sensor Data Repository
+        * sel - System Event Log
+        * boot - Set next boot mode to BIOS/PXE (does not reboot server!)
+        * reboot - Reboot Server
+        * poweron - Power On a down server
+        * kdump - Send NMI to server to initiate kdump
+
+        * Dell/PERC-specific Tools (see examples below):
+          "drive_status" - Check status of disks on PERC via RACADM
+          "drive_locate" - Turn 'on'/'off' Drive Identification light on given slot #
+                           The LED on the right side of drive carrier will blink steadily.
+          "nvme_status"  - Check the status of NVMe drives (where applicable)
+          "nvme_locate"  - Turn 'on'/'off' drive identification light on given slot # (NVMe applications)
+                           The LED on the right side of drive carrier will blink steadily.
+
+    Additional arguments for most commands:
+        --name HOSTNAME       REQUIRED: Hostname of server for operation
+        --reason THINGS       OPTIONAL: Reason for reboot, some words
+        --magic HASH          OPTIONAL: Magic number to confirm you really want to reboot.
+
+
+        *** Examples:
+                ./ipmi power --name nyc3node9999
+                ./ipmi boot pxe --name nyc3node9999
+                ./ipmi reboot --name nyc3node9999 --magic a1b2c3d4 --reason OPS-1234: Bad Times.
+                ./ipmi drive_locate on 12 --name nyc3node9999
+                ./ipmi drive_locate off 12 --name nyc3node9999```'''
+
+
+def cmd_run(tool, arguments):
+    """
+    Call an external program and return the output
+    """
+    # Build our request for subprocess
+    cmd_req = [tool]
+    for arg in arguments.split(' '):
+        cmd_req.append(arg)
+
+    process = subprocess.Popen(
+        cmd_req, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = process.communicate()
+
+    if not err:
+        return out
+    else:
+        return err
+
+
+def dell_drive_status(hostname):
+    """
+    Get some drive info from a Dell server
+    """
+    # Get the IPMI interface address
+    bmc_addr = get_ipmi_address(hostname)
+
+    # Check if we are on a Dell
+    with chef.ChefAPI('https://chef-public', '/home/node/.chef/hubot.pem', 'hubot'):
+        query = chef.Search('node').query('name:'+hostname[0]+'.*')
+        if query.total == 0:
+            print "IPMI Error: Unable to determine Server manufacturer, can not proceed."
+            sys.exit(1)
+
+    if "Dell" not in query[0]['automatic']['manufacturer']:
+        print "IPMI: Sorry, this does not appear to be a Dell server."
+        sys.exit(1)
+
+    # SSH into the BMC and query drive info from RACADM
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(bmc_addr, username='root',
+                    password=os.environ.get('IPMI_PASSWORD'), timeout=10)
+        stdin, stdout, stderr = ssh.exec_command(
+            "racadm raid get pdisks -o -p status,size,serialnumber"
+        )
+        stdin.write('pong\n')  # make sure things are moving in the buffer
+        stdin.flush()
+        disk_result = stdout.read()
+        ssh.close()
+    except (paramiko.AuthenticationException, paramiko.SSHException) as e:
+        print "IPMI/SSH Error: %s" % e
+        sys.exit(1)
+
+    # Get a count of drives here, if ODD number, we're missing one!
+    disk_count = 0
+    for line in disk_result.split('\n'):
+        if 'Bay' in line:
+            disk_count += 1
+
+    # Show the results
+    print disk_result
+
+    # If we have an odd number of disks, print a warning
+    if disk_count % 2 != 0:
+        print "*** WARNING: Odd number of drives found, server may be missing a disk! ***"
+    sys.exit(0)
+
+
+def dell_drive_locate(hostname, state, slot):
+    """
+    Turn on drive identifier on give drive slot in a Dell server
+    """
+    # Get the IPMI interface address
+    bmc_addr = get_ipmi_address(hostname)
+
+    # Check if we are on a Dell
+    with chef.ChefAPI('https://chef-public', '/home/node/.chef/opsbot.pem', 'opsbot'):
+        query = chef.Search('node').query('name:'+hostname[0]+'.*')
+        if query.total == 0:
+            print "IPMI Error: Unable to determine Server manufacturer, can not proceed."
+            sys.exit(1)
+
+    if "Dell" not in query[0]['automatic']['manufacturer']:
+        print "IPMI: Sorry, this does not appear to be a Dell server."
+        sys.exit(1)
+
+    # "blink" if on, anything else means off
+    state = ("blink" if state == "on" else "unblink")
+
+    # SSH into the BMC and query drive info from RACADM
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(bmc_addr, username='root',
+                    password=os.environ.get('IPMI_PASSWORD'), timeout=10)
+        stdin, stdout, stderr = ssh.exec_command(
+            "racadm raid "+state+":Disk.Bay."+slot +
+            ":Enclosure.Internal.0-1:RAID.Integrated.1-1"
+        )
+        stdin.write('pong\n')  # make sure things are moving in the buffer
+        stdin.flush()
+        disk_result = stdout.read()
+        ssh.close()
+    except (paramiko.AuthenticationException, paramiko.SSHException) as e:
+        print "IPMI/SSH Error: %s" % e
+        sys.exit(1)
+
+    if "STOR095" in disk_result:
+        print "%s: Drive in Slot %s sucessfully set to %s." % (hostname[0], slot, state)
+        sys.exit(0)
+
+
+def nvme_drive_status(hostname):
+    """
+    Get drive info for NVMe based servers
+    """
+    # Get the IPMI interface address
+    bmc_addr = get_ipmi_address(hostname)
+
+    # Retrieve hardware manufacturer
+    with chef.ChefAPI('https://chef-public', '/home/node/.chef/opsbot.pem', 'opsbot'):
+        query = chef.Search('node').query('name:'+hostname[0]+'.*')
+        if query.total == 0:
+            print "IPMI Error: Unable to determine Server manufacturer, can not proceed."
+            sys.exit(1)
+
+    valid_manufacturers = ['Dell', 'Supermicro']
+    if query[0]['automatic']['manufacturer'] not in valid_manufacturers:
+        print "This feature is not yet implemented for this manufacturer"
+        sys.exit(1)
+
+    # Connect to the BMC Redfish endpoint
+    try:
+        REDFISH_OBJ = redfish.redfish_client(base_url='https://'+bmc_addr, username='root',
+                                             password=os.environ.get('IPMI_PASSWORD'), timeout=10)
+        REDFISH_OBJ.login(auth="basic")
+    except (redfish.rest.v1.InvalidCredentialsError, redfish.rest.v1.RetriesExhaustedError,
+            redfish.rest.v1.ServerDownOrUnreachableError) as e:
+        print "IPMI/Redfish Connection Error: %s" % e
+        sys.exit(1)
+    else:
+        try:
+            disk_result = REDFISH_OBJ.get(
+                "/redfish/v1/Systems/System.Embedded.1/SimpleStorage/Controllers/CPU.1", None)
+        except Exception as e:
+            print "IPMI/Redfish Storage Action Error: %s" % e
+            sys.exit(1)
+        else:
+            REDFISH_OBJ.logout()
+
+    # Return disk status information
+    diskoutput = []
+    for line in disk_result.dict['Devices']:
+        if 'Bay' in line['Name']:
+            new_line = "Model: %s Location: %s Capacity(bytes): %s Health: %s" % (
+                       line['Model'].rstrip(), line['Name'], line['CapacityBytes'], line['Status']['Health'])
+            diskoutput.append(new_line)
+
+    if diskoutput:
+        print("\n".join(diskoutput))
+    else:
+        print "No compatible drives found or other error occurred"
+
+    sys.exit(0)
+
+
+def nvme_drive_locate(hostname, state, slot):
+    """
+    Turn on drive identifier on given drive slot for an NVMe drive
+    """
+    # Get the IPMI interface address
+    bmc_addr = get_ipmi_address(hostname)
+
+    # Retrieve hardware manufacturer
+    with chef.ChefAPI('https://chef-public', '/home/node/.chef/opsbot.pem', 'opsbot'):
+        query = chef.Search('node').query('name:'+hostname[0]+'.*')
+        if query.total == 0:
+            print "IPMI Error: Unable to determine Server manufacturer, can not proceed."
+            sys.exit(1)
+
+    if "Dell" not in query[0]['automatic']['manufacturer']:
+        print "This feature is not yet implemented for this manufacturer"
+        sys.exit(1)
+
+    # "blink" if on, anything else means off
+    state = ("BlinkTarget" if state == "on" else "UnBlinkTarget")
+
+    # Connect to the BMC Redfish endpoint
+    try:
+        REDFISH_OBJ = redfish.redfish_client(base_url='https://'+bmc_addr, username='root',
+                                             password=os.environ.get('IPMI_PASSWORD'), timeout=10)
+        REDFISH_OBJ.login(auth="basic")
+    except (redfish.rest.v1.InvalidCredentialsError, redfish.rest.v1.RetriesExhaustedError,
+            redfish.rest.v1.ServerDownOrUnreachableError) as e:
+        print "IPMI/Redfish Error: %s" % e
+        sys.exit(1)
+    else:
+        try:
+            body = {"TargetFQDD": "Disk.Bay."+slot+":Enclosure.Internal.0-1"}
+            locate = REDFISH_OBJ.post(
+                "/redfish/v1/Dell/Systems/System.Embedded.1/DellRaidService/Actions/DellRaidService."+state, body=body)
+        except Exception as e:
+            print "IPMI/Redfish Error: %s" % e
+            sys.exit(1)
+        else:
+            REDFISH_OBJ.logout()
+
+    if locate.status == 200:
+        print "%s: Drive in Slot %s sucessfully set to %s." % (hostname[0], slot, state[0:-6])
+        sys.exit(0)
+    else:
+        print "Drive locate LED change unsuccessful: %s" % locate.dict['error']['@Message.ExtendedInfo'][0]['Message']
+        sys.exit(1)
+
+
+def get_ipmi_address(hostname):
+    """
+    Get our IPMI IP address from the hostname using a Chef search
+    """
+    with chef.ChefAPI('https://chef-public', '/home/node/.chef/opsbot.pem', 'opsbot'):
+        query = chef.Search('node').query('name:'+hostname[0]+'.*')
+        if query.total == 0:
+            print "IPMI Error: Unknown hostname (%s), unable to get IPMI Address from Chef!" % hostname[0]
+            sys.exit(1)
+        elif query.total > 1:
+            print "IPMI Error: Multiple results returned by Chef; does your hostname include a region?"
+            print "IPMI Error: Please be more specific with your hostname."
+            sys.exit(1)
+        else:
+            try:
+                ipmi_addr = query[0]['automatic']['ipmi']['address']
+            except KeyError:
+                print "IPMI Error: Host missing all IPMI attributes!"
+                sys.exit(1)
+
+    if ipmi_addr == "''" or ipmi_addr == '':
+        print "IPMI Error: Blank or No IPMI address found for %s!" % hostname[0]
+        sys.exit(1)
+
+    # If we get a bad address, bail out
+    if ipmi_addr == "0.0.0.0":
+        print "IPMI Error: IPMI address is 0.0.0.0 for %s!" % hostname[0]
+        sys.exit(1)
+
+    # We either got an address or got nothing back.
+    return ipmi_addr
+
+
+def run_ipmi_cmd(hostname, command):
+    """
+    Run the requested IPMI command
+    """
+    # First ping the BMC really quick...
+    # This does add a bit of delay, but if we fail here we're done for anyway.
+    bmc_ping = cmd_run("/bin/ping", "-c 2 "+get_ipmi_address(hostname))
+    if "100% packet loss" in bmc_ping:
+        print "IPMI: Error! Unable to reach BMC interface address. Ping timeout."
+        sys.exit(1)
+
+    # Run it with a timeout
+    ipmi_result = cmd_run("/usr/bin/timeout", "--kill-after=30 30s /usr/bin/ipmitool -H " +
+                          get_ipmi_address(hostname)+" -U root -P " + os.environ.get('IPMI_PASSWORD') +
+                          " -I lanplus "+command)
+
+    if ipmi_result == '':
+        print "IPMI Error: The request timed out. Please try again."
+    elif "Error: Unable to establish IPMI" in ipmi_result:
+        # Check if we possibly have bad credentials
+        cred_check = cmd_run("/usr/bin/timeout", "--kill-after=30 30s /usr/bin/ipmitool -v -H " +
+                             get_ipmi_address(hostname)+" -U root -P "+os.environ.get('IPMI_PASSWORD') +
+                             " -I lanplus "+command)
+        if "RAKP 2 HMAC is invalid" in cred_check:
+            print "IPMI Error: Invalid IPMI login/password on server. Chef may not have run."
+        sys.exit(1)
+    else:
+        print ipmi_result
+
+
+def atl_mark_offline(hostname, reason):
+    """
+    Log the host reboot request and mark it offline
+    """
+    requests.packages.urllib3.disable_warnings()
+    atl_login = os.environ.get('ATLANTIS_USER')
+    atl_password = os.environ.get('ATLANTIS_PASSWORD')
+    atl_url = "https://atlantis"
+
+    # Mark the host as "is_offline" (PLAT-915), best effort.
+    try:
+        server_query = requests.get(
+            atl_url+"/api/v1/servers/"+hostname, auth=(atl_login, atl_password))
+        server_data = server_query.json()
+        requests.put(atl_url+"/api/v1/servers/"+str(server_data['server']['id'])+"/set/offline",
+                     auth=(atl_login, atl_password), data={'reason': reason})
+    except:
+        print "IPMI / Reboot: Unable to mark %s offline. Machine likely not in Atlantis." % hostname
+
+
+def parse_ipmi_cmd(hostname, command, magic, reason, special):
+    """
+    Parse the arguments provided, check for missing arguments and finally call the actual tool.
+    """
+    if command == "power":
+        run_ipmi_cmd(hostname, "chassis power status")
+    elif command == "health":
+        run_ipmi_cmd(hostname, "sensor")
+    elif command == "sel":
+        run_ipmi_cmd(hostname, "sel elist")
+    elif command == "boot":
+        # Try to get our address before we bug people for further info
+        ipmi_addr = get_ipmi_address(hostname)
+
+        boot_bad_args = "Error: Invalid boot target specified!\n" + \
+            "\tPlease add one of the following to your request:\n" + \
+            "\t\tboot pxe\n" + \
+            "\t\tboot bios\n" + \
+            "E.g: ./ipmi boot pxe --name nyc3node9999"
+
+        if special:
+            if special[0] != "pxe" and special[0] != "bios":
+                print boot_bad_args
+                sys.exit(1)
+
+            run_ipmi_cmd(hostname, "chassis bootdev " + special[0])
+            run_ipmi_cmd(
+                hostname, "chassis bootparam set bootflag force_" + special[0])
+        else:
+            print boot_bad_args
+            sys.exit(1)
+
+    elif command == "reboot" or command == "kdump":
+        # Try to get our address before we bug people for further info
+        ipmi_addr = get_ipmi_address(hostname)
+        host_magic = hashlib.md5(hostname[0]).hexdigest()
+
+        if magic:
+            if magic[0] != host_magic[0:10]:
+                print "IPMI Error: Bad magic number: %s. Please try again." % magic[0]
+                sys.exit(1)
+            if reason:
+                if command == "reboot":
+                    # We have everything, let's reboot
+                    print "Rebooting %s due to reason: %s" % (hostname[0], str(' '.join(reason)))
+                    run_ipmi_cmd(hostname, "chassis power cycle")
+                elif command == "kdump":
+                    # kdump instead of reboot
+                    print "kdump-ing %s due to reason: %s" % (hostname[0], str(' '.join(reason)))
+                    run_ipmi_cmd(hostname, "chassis power diag")
+                # Mark the host as offline in atlantis
+                atl_mark_offline(hostname[0], str(' '.join(reason)))
+            else:
+                print "IPMI: No reason provided! Please append --reason."
+                sys.exit(1)
+        else:
+            # Get the first 10 characters of the MD5 sum for our 'magic' number
+            print "IPMI: Please append --magic number: %s" % host_magic[0:10]
+            sys.exit(1)
+    elif command == "drive_locate":
+        if special and len(special) == 2:
+            if special[1].isdigit():
+                dell_drive_locate(hostname, special[0], special[1])
+            else:
+                print "IPMI: Please check your input, the slot# doesn't seem right!"
+                sys.exit(1)
+        else:
+            print "IPMI Error: Not enough arguments to 'drive_locate' command!\n"
+            print TOOL_HELPTEXT
+            sys.exit(1)
+    elif command == "drive_status" or command == "drives_status":
+        dell_drive_status(hostname)
+    elif command == "nvme_locate":
+        if special and len(special) == 2:
+            if special[1].isdigit():
+                nvme_drive_locate(hostname, special[0], special[1])
+            else:
+                print "IPMI: Please check your input, the slot# doesn't seem right!"
+                sys.exit(1)
+        else:
+            print "IPMI Error: Not enough arguments to 'nvme_locate' command!\n"
+            print TOOL_HELPTEXT
+            sys.exit(1)
+    elif command == "nvme_status":
+        nvme_drive_status(hostname)
+    elif command == "poweron":
+        run_ipmi_cmd(hostname, "chassis power on")
+
+
+def main():
+    """
+    Where the magic happens.
+    """
+    # Build our list of acceptable commands
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     description=textwrap.dedent(TOOL_HELPTEXT), add_help=False,
+                                     usage=argparse.SUPPRESS)
+    parser.add_argument("command", choices=['help', 'power', 'poweron', 'health', 'sel', 'boot', 'reboot',
+                                            'drive_status', 'drives_status', 'drive_locate', 'nvme_status', 'nvme_locate', 'kdump'], help=argparse.SUPPRESS)
+    parser.add_argument("--name", metavar='HOSTNAME', required=True, nargs=1,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--reason", metavar='', type=str, nargs='+',
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--magic", metavar='HASH',
+                        nargs=1, help=argparse.SUPPRESS)
+    parser.add_argument("special", metavar='BOOT/DRIVE_LOCATE', nargs='*',
+                        help=argparse.SUPPRESS)
+
+    # This is hacky but easiest way to prevent the initial, confusing argparse help output
+    # This is done before argparse can process the rest of our arguments.
+    if len(sys.argv) > 1 and "help" in sys.argv[1] or len(sys.argv) > 1 and sys.argv[1] == "-h":
+        parser.print_help()
+        sys.exit(0)
+    elif len(sys.argv) == 1:
+        print "Usage: ./ipmi help\n"
+        sys.exit(1)
+
+    # Parse the passed args
+    args = parser.parse_args()
+
+    # Check to make sure we have ENV vars set
+    if os.environ.get('IPMI_PASSWORD') is None:
+        print "IPMI Error: Unable to find environmental variables, configuration error."
+        sys.exit(1)
+
+    # Make sure we're working with one host a time for now. Will add more later.
+    if len(args.name[0].split(',')) > 1:
+        print "IPMI Error: Please provide one hostname at a time."
+        sys.exit(1)
+
+    # Check if the requesting user has OPS role
+    if os.environ.get('HAS_OPS_ROLE') != '1':
+        print "You need to have ops role to run this command."
+        sys.exit(1)
+
+    # Pass our hostname, command to be processed and send any optional args if necessary
+    if args.name and args.command:
+        parse_ipmi_cmd(args.name, args.command, args.magic,
+                       args.reason, args.special)
+
+
+if __name__ == '__main__':
+    main()
